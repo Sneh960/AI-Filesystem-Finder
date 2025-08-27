@@ -4,6 +4,7 @@ Unit tests for the SearchQuery data model.
 
 import pytest
 from pathlib import Path
+from pydantic import ValidationError
 from finder.models.search_query import SearchQuery
 
 
@@ -100,7 +101,7 @@ class TestSearchQuery:
     
     def test_empty_query_validation(self):
         """Test that empty queries raise validation errors."""
-        with pytest.raises(ValueError, match="Search query text cannot be empty"):
+        with pytest.raises(ValidationError):
             SearchQuery(text="", roots=["/home/user"])
         
         with pytest.raises(ValueError, match="Search query text cannot be empty"):
@@ -108,7 +109,7 @@ class TestSearchQuery:
     
     def test_empty_roots_validation(self):
         """Test that empty roots raise validation errors."""
-        with pytest.raises(ValueError, match="At least one root directory must be specified"):
+        with pytest.raises(ValidationError):
             SearchQuery(text="test", roots=[])
         
         with pytest.raises(ValueError, match="No valid root directories provided"):

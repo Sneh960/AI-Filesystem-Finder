@@ -187,6 +187,7 @@ Thumbs.db
 # Log files
 *.log
 logs/
+.finderagent.yaml
 
 # API keys and sensitive data
 api_keys.txt
