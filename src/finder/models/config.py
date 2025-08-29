@@ -221,6 +221,8 @@ class SecurityConfig(BaseModel):
         redact_patterns: Patterns to redact from output for privacy
         max_snippet_length: Maximum length of content snippets
         allow_binary_files: Whether to process binary files
+        preview_max_files: Maximum number of files to show in preview mode
+        preview_max_depth: Maximum directory depth to show in preview
     """
     
     dry_run: bool = Field(False, description="Whether to run in preview mode without executing")
@@ -230,6 +232,8 @@ class SecurityConfig(BaseModel):
     )
     max_snippet_length: int = Field(500, gt=0, description="Maximum length of content snippets")
     allow_binary_files: bool = Field(False, description="Whether to process binary files")
+    preview_max_files: int = Field(100, gt=0, description="Maximum number of files to show in preview mode")
+    preview_max_depth: int = Field(3, gt=0, description="Maximum directory depth to show in preview")
     
     def model_post_init(self, __context) -> None:
         """Validate security configuration and compile patterns."""
@@ -312,7 +316,7 @@ class FinderConfig(BaseModel):
         self._compile_ignore_patterns()
     
     def _validate_roots(self) -> None:
-        """Validate and normalize root directories."""
+        """Validate and normalize root directories with allowlist security checks."""
         if not self.roots:
             raise ValueError("At least one root directory must be specified")
         
@@ -321,8 +325,14 @@ class FinderConfig(BaseModel):
             if not root or not root.strip():
                 continue
             
+            # Check for dangerous patterns before path resolution
+            self._validate_path_safety_raw(root)
+            
             # Expand user path and resolve
             root_path = Path(root).expanduser().resolve()
+            
+            # Perform allowlist validation and security checks
+            self._validate_allowlist_security(root_path)
             
             # Check if path exists (in non-dry-run mode)
             if not self.security.dry_run and not root_path.exists():
@@ -337,6 +347,9 @@ class FinderConfig(BaseModel):
         if not normalized_roots:
             raise ValueError("No valid root directories provided")
         
+        # Validate for path traversal and overlapping roots
+        self._validate_root_relationships(normalized_roots)
+        
         self.roots = normalized_roots
     
     def _normalize_ignore_patterns(self) -> None:
@@ -348,12 +361,30 @@ class FinderConfig(BaseModel):
             
             pattern = pattern.strip()
             
-            # Ensure patterns are properly formatted
-            if not pattern.startswith('**/') and not pattern.startswith('./') and not pattern.startswith('/'):
-                # Add **/ prefix for relative patterns
-                pattern = '**/' + pattern
+            # Skip empty patterns and comments
+            if not pattern or pattern.startswith('#'):
+                continue
             
-            normalized_patterns.append(pattern)
+            # Handle negation patterns specially
+            if pattern.startswith('!'):
+                # For negation patterns, normalize the part after !
+                negated_pattern = pattern[1:]
+                if (negated_pattern.startswith('**/') or 
+                    negated_pattern.startswith('./') or 
+                    negated_pattern.startswith('/') or
+                    '/' in negated_pattern):
+                    normalized_patterns.append(pattern)
+                else:
+                    # Add **/ prefix to the negated part
+                    normalized_patterns.append('!' + '**/' + negated_pattern)
+            # Don't modify patterns that are already properly formatted
+            elif (pattern.startswith('**/') or 
+                  pattern.startswith('./') or 
+                  pattern.startswith('/')):
+                normalized_patterns.append(pattern)
+            else:
+                # Add **/ prefix for relative patterns (including those with /)
+                normalized_patterns.append('**/' + pattern)
         
         self.ignore = normalized_patterns
     
@@ -364,36 +395,460 @@ class FinderConfig(BaseModel):
             try:
                 # Convert gitignore-style patterns to regex
                 regex_pattern = self._gitignore_to_regex(pattern)
-                self._compiled_ignore_patterns.append(re.compile(regex_pattern))
+                is_negation = pattern.lstrip().startswith('!')
+                
+                # Store pattern info for processing
+                pattern_info = {
+                    'regex': re.compile(regex_pattern),
+                    'is_negation': is_negation,
+                    'original': pattern
+                }
+                self._compiled_ignore_patterns.append(pattern_info)
             except re.error as e:
                 raise ValueError(f"Invalid ignore pattern '{pattern}': {e}")
     
+    def _validate_allowlist_security(self, root_path: Path) -> None:
+        """
+        Validate root directory against allowlist security policies.
+        
+        This method implements explicit allowlist validation to ensure only
+        explicitly configured directories can be searched, protecting sensitive
+        system areas.
+        
+        Args:
+            root_path: Resolved path to validate
+            
+        Raises:
+            ValueError: If path violates allowlist security policies
+        """
+        # Define sensitive system directories that should be blocked
+        sensitive_paths = self._get_sensitive_system_paths()
+        
+        # Check if root path is a sensitive system directory
+        for sensitive_path in sensitive_paths:
+            try:
+                sensitive_resolved = Path(sensitive_path).expanduser().resolve()
+                
+                # Check if root is exactly a sensitive path
+                if root_path == sensitive_resolved:
+                    raise ValueError(
+                        f"Root directory '{root_path}' is a sensitive system directory. "
+                        f"For security, please specify a more specific subdirectory."
+                    )
+                
+                # Check if root is a parent of sensitive paths (too broad)
+                try:
+                    sensitive_resolved.relative_to(root_path)
+                    # If we get here, root_path contains the sensitive path
+                    if not self.security.dry_run:
+                        raise ValueError(
+                            f"Root directory '{root_path}' contains sensitive system directory "
+                            f"'{sensitive_resolved}'. Please use a more specific path or enable "
+                            f"appropriate ignore patterns."
+                        )
+                except ValueError:
+                    # relative_to failed, which means sensitive_path is not under root_path
+                    # This is fine, continue checking
+                    pass
+                    
+            except (OSError, RuntimeError):
+                # Path resolution failed, skip this check
+                continue
+        
+        # Validate path doesn't use dangerous patterns
+        self._validate_path_safety(root_path)
+    
+    def _get_sensitive_system_paths(self) -> List[str]:
+        """
+        Get list of sensitive system paths that should be protected.
+        
+        Returns:
+            List of sensitive system directory paths
+        """
+        import platform
+        
+        sensitive_paths = [
+            # Universal sensitive paths
+            "/",  # Root filesystem
+            "/etc",  # System configuration
+            "/var/log",  # System logs
+            "/tmp",  # Temporary files (privacy concern)
+            "/dev",  # Device files
+            "/proc",  # Process information
+            "/sys",  # System information
+        ]
+        
+        system = platform.system().lower()
+        
+        if system == "linux":
+            sensitive_paths.extend([
+                "/boot",  # Boot files
+                "/root",  # Root user home
+                "/var/lib",  # System data
+                "/usr/lib",  # System libraries
+                "/lib",  # System libraries
+                "/sbin",  # System binaries
+                "/bin",  # System binaries
+            ])
+        elif system == "darwin":  # macOS
+            sensitive_paths.extend([
+                "/System",  # macOS system files
+                "/Library/System",  # System library
+                "/private",  # Private system files
+                "/var/root",  # Root user home
+                "/usr/lib",  # System libraries
+                "/usr/libexec",  # System executables
+                "/bin",  # System binaries
+                "/sbin",  # System binaries
+            ])
+        elif system == "windows":
+            sensitive_paths.extend([
+                "C:\\Windows",  # Windows system
+                "C:\\Program Files",  # Installed programs
+                "C:\\Program Files (x86)",  # 32-bit programs
+                "C:\\ProgramData",  # Application data
+                "C:\\System Volume Information",  # System restore
+                "C:\\$Recycle.Bin",  # Recycle bin
+            ])
+        
+        return sensitive_paths
+    
+    def _validate_path_safety_raw(self, root_str: str) -> None:
+        """
+        Validate that the raw path string doesn't contain dangerous patterns.
+        
+        Args:
+            root_str: Raw path string to validate
+            
+        Raises:
+            ValueError: If path contains dangerous patterns
+        """
+        # Check for path traversal attempts
+        dangerous_patterns = [
+            "..",  # Parent directory traversal
+            "//",  # Double slashes (can bypass filters)
+            "\\\\",  # Windows UNC paths (if not intended)
+        ]
+        
+        for pattern in dangerous_patterns:
+            if pattern in root_str:
+                raise ValueError(
+                    f"Root directory '{root_str}' contains potentially dangerous "
+                    f"pattern '{pattern}'. Please use a clean, absolute path."
+                )
+    
+    def _validate_path_safety(self, root_path: Path) -> None:
+        """
+        Validate that the path doesn't contain dangerous patterns.
+        
+        Args:
+            root_path: Path to validate
+            
+        Raises:
+            ValueError: If path contains dangerous patterns
+        """
+        # Validate path can be resolved
+        try:
+            normalized = root_path.resolve()
+            # Note: We don't check if normalized != root_path because resolve() 
+            # is expected to normalize the path
+        except (OSError, RuntimeError) as e:
+            raise ValueError(f"Cannot resolve root directory path '{root_path}': {e}")
+    
+    def _validate_root_relationships(self, normalized_roots: List[str]) -> None:
+        """
+        Validate relationships between root directories to prevent conflicts.
+        
+        Args:
+            normalized_roots: List of normalized root directory paths
+            
+        Raises:
+            ValueError: If roots have problematic relationships
+        """
+        if len(normalized_roots) <= 1:
+            return
+        
+        # Check for duplicate roots
+        unique_roots = set(normalized_roots)
+        if len(unique_roots) != len(normalized_roots):
+            duplicates = [root for root in normalized_roots if normalized_roots.count(root) > 1]
+            raise ValueError(f"Duplicate root directories found: {set(duplicates)}")
+        
+        # Check for nested roots (one root contains another)
+        for i, root1 in enumerate(normalized_roots):
+            path1 = Path(root1)
+            for j, root2 in enumerate(normalized_roots):
+                if i == j:
+                    continue
+                
+                path2 = Path(root2)
+                
+                # Check if root2 is nested under root1
+                try:
+                    path2.relative_to(path1)
+                    # If we get here, path2 is under path1
+                    raise ValueError(
+                        f"Root directory '{root2}' is nested under another root '{root1}'. "
+                        f"This can cause duplicate results and performance issues. "
+                        f"Please remove the nested root or use ignore patterns."
+                    )
+                except ValueError as e:
+                    # Check if this is a "not relative" error or our nested root error
+                    if "is nested under another root" in str(e):
+                        # Re-raise our validation error
+                        raise
+                    # Otherwise, relative_to failed, which means path2 is not under path1
+                    # This is fine, continue checking
+                    pass
+    
     def _gitignore_to_regex(self, pattern: str) -> str:
-        """Convert gitignore-style pattern to regex."""
-        # Handle special gitignore patterns
-        if pattern.startswith('**/'):
-            # **/ means zero or more directories
-            pattern = pattern[3:]
-            regex = r'(^|.*/)' + fnmatch.translate(pattern).replace(r'\Z', '')
-        elif pattern.endswith('/**'):
-            # /** means everything inside directory
-            pattern = pattern[:-3]
-            regex = fnmatch.translate(pattern).replace(r'\Z', '') + r'(/.*)?'
+        """
+        Convert gitignore-style pattern to regex.
+        
+        Supports common gitignore patterns including:
+        - Basic wildcards (* and ?)
+        - Directory wildcards (**)
+        - Directory-only patterns (trailing /)
+        - Rooted patterns (leading /)
+        - Character classes [abc] and [!abc]
+        
+        Args:
+            pattern: Gitignore-style pattern
+            
+        Returns:
+            Compiled regex pattern string
+        """
+        if not pattern or pattern.isspace():
+            return r'(?!.*)'  # Never matches anything
+        
+        original_pattern = pattern
+        
+        # Handle negation patterns (starting with !)
+        if pattern.startswith('!'):
+            pattern = pattern[1:]  # Remove the ! for regex processing
+            if not pattern:
+                return r'(?!.*)'  # Invalid pattern
+        
+        # Handle comments and empty patterns
+        if pattern.startswith('#') or not pattern.strip():
+            return r'(?!.*)'  # Never matches anything
+        
+        # Check if pattern is directory-only (ends with /)
+        is_directory_only = pattern.endswith('/')
+        if is_directory_only:
+            pattern = pattern[:-1]  # Remove trailing slash
+        
+        # Check if pattern is rooted (starts with /)
+        is_rooted = pattern.startswith('/')
+        if is_rooted:
+            pattern = pattern[1:]  # Remove leading slash
+        
+        # Handle special cases
+        if not pattern:
+            # Pattern was just "/" - matches root directory
+            return r'^/?$'
+        
+        # Convert gitignore pattern to regex using fnmatch as base
+        # but handle ** specially
+        if '**' in pattern:
+            # Handle ** patterns
+            parts = pattern.split('**')
+            regex_parts = []
+            
+            for i, part in enumerate(parts):
+                if i > 0:
+                    # Add ** regex between parts
+                    prev_part = parts[i-1]
+                    
+                    # Determine the type of ** pattern
+                    if prev_part == '':
+                        # Pattern starts with ** (like **/something)
+                        if part.startswith('/'):
+                            # **/ at start - zero or more directories
+                            regex_parts.append(r'(?:[^/]+/)*')
+                            part = part[1:]  # Remove leading /
+                        else:
+                            # ** at start without / - match anything
+                            regex_parts.append(r'.*')
+                    elif part == '':
+                        # Pattern ends with ** (like something/**)
+                        if prev_part.endswith('/'):
+                            # /** at end - everything under directory
+                            regex_parts.append(r'.*')
+                        else:
+                            # ** at end without / - match anything
+                            regex_parts.append(r'.*')
+                    else:
+                        # ** in middle (like something/**/other)
+                        if part.startswith('/') and prev_part.endswith('/'):
+                            # /**/  - zero or more directories for most cases
+                            # but one or more for patterns like build/**/temp
+                            if len(prev_part.rstrip('/')) > 0 and len(part.lstrip('/')) > 0:
+                                # Both sides have content - require at least one directory
+                                regex_parts.append(r'(?:[^/]+/)+')
+                            else:
+                                # One side is empty - zero or more directories
+                                regex_parts.append(r'(?:[^/]+/)*')
+                            part = part[1:]  # Remove leading /
+                        elif part.startswith('/'):
+                            # **/ where previous doesn't end with /
+                            regex_parts.append(r'(?:[^/]+/)+')
+                            part = part[1:]  # Remove leading /
+                        elif prev_part.endswith('/'):
+                            # /** where next doesn't start with /
+                            regex_parts.append(r'.*')
+                        else:
+                            # ** without surrounding slashes
+                            regex_parts.append(r'.*')
+                
+                if part:
+                    # Convert the non-** part using fnmatch
+                    part_regex = fnmatch.translate(part)
+                    # Remove the \Z anchor that fnmatch adds
+                    part_regex = part_regex.replace(r'\Z', '')
+                    regex_parts.append(part_regex)
+            
+            escaped_pattern = ''.join(regex_parts)
         else:
-            regex = fnmatch.translate(pattern)
+            # No ** patterns, use fnmatch directly
+            escaped_pattern = fnmatch.translate(pattern)
+            # Remove the \Z anchor that fnmatch adds
+            escaped_pattern = escaped_pattern.replace(r'\Z', '')
+            
+            # For rooted patterns, ensure * doesn't match /
+            if is_rooted and '*' in pattern:
+                # Replace .* with [^/]* to prevent matching across directories
+                escaped_pattern = escaped_pattern.replace('.*', '[^/]*')
+        
+        # Build the final regex
+        if is_rooted:
+            # Rooted pattern - must match from start of path
+            if is_directory_only:
+                # Directory pattern - match the directory and everything inside it
+                regex = f'^{escaped_pattern}(/.*)?$'
+            else:
+                regex = f'^{escaped_pattern}$'
+        else:
+            # Non-rooted pattern - can match anywhere in path
+            if '/' in original_pattern:
+                # Pattern contains slash - match against full path
+                if is_directory_only:
+                    # Directory pattern - match the directory and everything inside it
+                    regex = f'(^|/){escaped_pattern}(/.*)?$'
+                else:
+                    regex = f'(^|/){escaped_pattern}$'
+            else:
+                # Pattern has no slash - match against basename
+                if is_directory_only:
+                    # Directory pattern - match the directory and everything inside it
+                    regex = f'(^|/){escaped_pattern}(/.*)?$'
+                else:
+                    regex = f'(^|/){escaped_pattern}(/|$)'
         
         return regex
     
     def should_ignore(self, path: str) -> bool:
-        """Check if a path should be ignored based on ignore patterns."""
-        # Normalize path for comparison
+        """
+        Check if a path should be ignored based on ignore patterns.
+        
+        Processes patterns in order, with later patterns potentially overriding
+        earlier ones (especially negation patterns starting with !).
+        
+        Args:
+            path: File or directory path to check
+            
+        Returns:
+            True if path should be ignored, False otherwise
+        """
+        # Normalize path for comparison - convert to POSIX style
         normalized_path = str(Path(path).as_posix())
         
-        for pattern in self._compiled_ignore_patterns:
-            if pattern.match(normalized_path):
-                return True
+        # Remove leading slash if present for consistent matching
+        if normalized_path.startswith('/'):
+            normalized_path = normalized_path[1:]
+        
+        # Track ignore state - start with not ignored
+        should_ignore_path = False
+        
+        # Process patterns in order
+        for i, pattern_info in enumerate(self._compiled_ignore_patterns):
+            pattern_regex = pattern_info['regex']
+            is_negation = pattern_info['is_negation']
+            original_pattern = pattern_info['original']
+            
+            # Test if pattern matches
+            if pattern_regex.search(normalized_path):
+                if is_negation:
+                    # Negation pattern - un-ignore the path
+                    should_ignore_path = False
+                else:
+                    # Regular pattern - ignore the path
+                    should_ignore_path = True
+        
+        return should_ignore_path
+    
+    def is_path_allowlisted(self, path: str) -> bool:
+        """
+        Check if a path is within the allowlisted root directories.
+        
+        This method enforces the allowlist security policy by ensuring that
+        only paths within explicitly configured root directories can be accessed.
+        
+        Args:
+            path: Path to check against allowlist
+            
+        Returns:
+            True if path is within allowlisted roots, False otherwise
+        """
+        try:
+            check_path = Path(path).expanduser().resolve()
+        except (OSError, RuntimeError):
+            # Cannot resolve path, consider it not allowlisted
+            return False
+        
+        # Check if path is under any of the allowlisted roots
+        for root in self.roots:
+            try:
+                root_path = Path(root).resolve()
+                
+                # Check if check_path is under root_path
+                try:
+                    check_path.relative_to(root_path)
+                    return True  # Path is under this root
+                except ValueError:
+                    # relative_to failed, path is not under this root
+                    continue
+                    
+            except (OSError, RuntimeError):
+                # Cannot resolve root path, skip it
+                continue
         
         return False
+    
+    def validate_path_access(self, path: str) -> None:
+        """
+        Validate that a path can be accessed according to allowlist policies.
+        
+        This method provides runtime validation to ensure that file operations
+        only occur within allowlisted directories.
+        
+        Args:
+            path: Path to validate for access
+            
+        Raises:
+            ValueError: If path is not allowlisted or violates security policies
+        """
+        if not self.is_path_allowlisted(path):
+            raise ValueError(
+                f"Path '{path}' is not within any allowlisted root directory. "
+                f"Allowlisted roots: {self.roots}"
+            )
+        
+        # Additional security check - ensure path doesn't violate ignore patterns
+        if self.should_ignore(path):
+            raise ValueError(
+                f"Path '{path}' matches ignore patterns and should not be accessed"
+            )
     
     def is_root_accessible(self, root: str) -> bool:
         """Check if a root directory is accessible."""
@@ -438,7 +893,321 @@ class FinderConfig(BaseModel):
         except (OSError, PermissionError):
             warnings.append(f"Cannot create output directory: {self.output.directory}")
         
+        # Allowlist security warnings
+        allowlist_warnings = self._get_allowlist_warnings()
+        warnings.extend(allowlist_warnings)
+        
         return warnings
+    
+    def _get_allowlist_warnings(self) -> List[str]:
+        """
+        Get warnings related to allowlist security configuration.
+        
+        Returns:
+            List of allowlist-related warning messages
+        """
+        warnings = []
+        
+        # Check for overly broad root directories
+        for root in self.roots:
+            try:
+                root_path = Path(root).resolve()
+                
+                # Warn about very broad roots
+                if str(root_path) in ["/", "C:\\", str(Path.home().parent)]:
+                    warnings.append(
+                        f"Root directory '{root}' is very broad and may impact performance "
+                        f"and security. Consider using more specific directories."
+                    )
+                
+                # Warn about system directories that might be sensitive
+                sensitive_indicators = ["/usr", "/var", "/opt", "C:\\Program Files"]
+                for indicator in sensitive_indicators:
+                    if str(root_path).startswith(indicator):
+                        warnings.append(
+                            f"Root directory '{root}' appears to be in a system directory. "
+                            f"Ensure this is intentional and appropriate ignore patterns are set."
+                        )
+                        break
+                
+            except (OSError, RuntimeError):
+                # Cannot resolve path, skip warnings for this root
+                continue
+        
+        # Check if user has too many roots (performance concern)
+        if len(self.roots) > 20:
+            warnings.append(
+                f"Large number of root directories ({len(self.roots)}) may impact "
+                f"performance. Consider consolidating or using fewer, broader roots "
+                f"with appropriate ignore patterns."
+            )
+        
+        # Check for missing ignore patterns that might be important for security
+        important_ignores = [
+            "**/.git/**",
+            "**/.env",
+            "**/node_modules/**",
+            "**/__pycache__/**",
+            "**/venv/**",
+            "**/.venv/**"
+        ]
+        
+        missing_ignores = []
+        for important_ignore in important_ignores:
+            if not any(ignore == important_ignore for ignore in self.ignore):
+                missing_ignores.append(important_ignore)
+        
+        if missing_ignores:
+            warnings.append(
+                f"Consider adding these common ignore patterns for security and performance: "
+                f"{', '.join(missing_ignores[:3])}{'...' if len(missing_ignores) > 3 else ''}"
+            )
+        
+        return warnings
+    
+    def get_preview_summary(self) -> Dict[str, Any]:
+        """
+        Get a summary of what would be searched in dry-run mode.
+        
+        Returns:
+            Dictionary containing preview information about the search scope
+        """
+        accessible_roots = self.get_accessible_roots()
+        inaccessible_roots = self.get_inaccessible_roots()
+        
+        # Estimate file counts for accessible roots
+        estimated_files = 0
+        preview_files = []
+        
+        for root in accessible_roots[:5]:  # Limit to first 5 roots for preview
+            try:
+                root_path = Path(root)
+                if root_path.exists() and root_path.is_dir():
+                    file_count, sample_files = self._preview_directory_contents(
+                        root_path, 
+                        max_files=self.security.preview_max_files // len(accessible_roots),
+                        max_depth=self.security.preview_max_depth
+                    )
+                    estimated_files += file_count
+                    preview_files.extend(sample_files)
+            except (OSError, PermissionError):
+                continue
+        
+        return {
+            'total_roots': len(self.roots),
+            'accessible_roots': len(accessible_roots),
+            'inaccessible_roots': len(inaccessible_roots),
+            'estimated_files': estimated_files,
+            'sample_files': preview_files[:self.security.preview_max_files],
+            'ignore_patterns_count': len(self.ignore),
+            'dry_run_enabled': self.security.dry_run,
+            'limits': {
+                'max_files': self.limits.max_files,
+                'max_file_size': self.limits.get_max_size_human_readable(),
+                'max_results': self.limits.max_results
+            }
+        }
+    
+    def _preview_directory_contents(self, root_path: Path, max_files: int = 50, max_depth: int = 3) -> tuple[int, List[Dict[str, Any]]]:
+        """
+        Preview directory contents without full traversal.
+        
+        Args:
+            root_path: Root directory to preview
+            max_files: Maximum number of sample files to collect
+            max_depth: Maximum depth to traverse
+            
+        Returns:
+            Tuple of (estimated_file_count, sample_files_list)
+        """
+        sample_files = []
+        total_files = 0
+        
+        try:
+            for current_depth in range(max_depth + 1):
+                if len(sample_files) >= max_files:
+                    break
+                
+                # Use iterdir for shallow traversal at each depth
+                if current_depth == 0:
+                    items_to_check = [root_path]
+                else:
+                    # Get directories from previous depth
+                    dirs_at_depth = []
+                    for item in root_path.rglob('*'):
+                        if item.is_dir() and len(item.relative_to(root_path).parts) == current_depth:
+                            dirs_at_depth.append(item)
+                    items_to_check = dirs_at_depth
+                
+                for directory in items_to_check:
+                    if len(sample_files) >= max_files:
+                        break
+                    
+                    try:
+                        for item in directory.iterdir():
+                            if item.is_file():
+                                # Check if file should be ignored
+                                relative_path = str(item.relative_to(root_path))
+                                if not self.should_ignore(relative_path):
+                                    total_files += 1
+                                    
+                                    if len(sample_files) < max_files:
+                                        try:
+                                            stat = item.stat()
+                                            sample_files.append({
+                                                'path': str(item.relative_to(root_path)),
+                                                'size': stat.st_size,
+                                                'size_human': self._format_file_size(stat.st_size),
+                                                'modified': stat.st_mtime,
+                                                'extension': item.suffix.lower() if item.suffix else None
+                                            })
+                                        except (OSError, PermissionError):
+                                            # Skip files we can't access
+                                            continue
+                    except (OSError, PermissionError):
+                        # Skip directories we can't access
+                        continue
+        
+        except (OSError, PermissionError):
+            # If we can't access the root, return empty results
+            pass
+        
+        return total_files, sample_files
+    
+    def _format_file_size(self, size_bytes: int) -> str:
+        """
+        Format file size in human-readable format.
+        
+        Args:
+            size_bytes: File size in bytes
+            
+        Returns:
+            Human-readable size string
+        """
+        if size_bytes == 0:
+            return "0 B"
+        
+        size = float(size_bytes)
+        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+            if size < 1024.0:
+                return f"{size:.1f} {unit}"
+            size /= 1024.0
+        return f"{size:.1f} PB"
+    
+    def generate_preview_report(self) -> str:
+        """
+        Generate a human-readable preview report for dry-run mode.
+        
+        Returns:
+            Formatted preview report as string
+        """
+        preview = self.get_preview_summary()
+        
+        report_lines = [
+            "# AI Filesystem Finder - Search Preview",
+            "",
+            "## Configuration Summary",
+            f"- **Dry Run Mode**: {'Enabled' if self.security.dry_run else 'Disabled'}",
+            f"- **Total Root Directories**: {preview['total_roots']}",
+            f"- **Accessible Roots**: {preview['accessible_roots']}",
+            f"- **Inaccessible Roots**: {preview['inaccessible_roots']}",
+            f"- **Ignore Patterns**: {preview['ignore_patterns_count']} configured",
+            "",
+            "## Search Scope Limits",
+            f"- **Maximum Files**: {preview['limits']['max_files']:,}",
+            f"- **Maximum File Size**: {preview['limits']['max_file_size']}",
+            f"- **Maximum Results**: {preview['limits']['max_results']}",
+            "",
+            "## Estimated Search Scope",
+            f"- **Estimated Files**: ~{preview['estimated_files']:,} files",
+            ""
+        ]
+        
+        # Add accessible roots
+        if preview['accessible_roots'] > 0:
+            report_lines.extend([
+                "## Accessible Root Directories",
+                ""
+            ])
+            for root in self.get_accessible_roots():
+                report_lines.append(f"- `{root}`")
+            report_lines.append("")
+        
+        # Add inaccessible roots if any
+        if preview['inaccessible_roots'] > 0:
+            report_lines.extend([
+                "## ⚠️ Inaccessible Root Directories",
+                ""
+            ])
+            for root in self.get_inaccessible_roots():
+                report_lines.append(f"- `{root}` (not found or no permission)")
+            report_lines.append("")
+        
+        # Add sample files
+        if preview['sample_files']:
+            report_lines.extend([
+                "## Sample Files (Preview)",
+                "",
+                "| File Path | Size | Extension |",
+                "|-----------|------|-----------|"
+            ])
+            
+            for file_info in preview['sample_files'][:20]:  # Show max 20 files
+                path = file_info['path']
+                size = file_info['size_human']
+                ext = file_info['extension'] or 'none'
+                report_lines.append(f"| `{path}` | {size} | {ext} |")
+            
+            if len(preview['sample_files']) > 20:
+                report_lines.append(f"| ... and {len(preview['sample_files']) - 20} more files | | |")
+            
+            report_lines.append("")
+        
+        # Add ignore patterns
+        if self.ignore:
+            report_lines.extend([
+                "## Ignore Patterns",
+                "",
+                "The following patterns will be excluded from search:",
+                ""
+            ])
+            for pattern in self.ignore[:10]:  # Show first 10 patterns
+                report_lines.append(f"- `{pattern}`")
+            
+            if len(self.ignore) > 10:
+                report_lines.append(f"- ... and {len(self.ignore) - 10} more patterns")
+            
+            report_lines.append("")
+        
+        # Add recommendations
+        report_lines.extend([
+            "## Recommendations",
+            ""
+        ])
+        
+        if preview['estimated_files'] > self.limits.max_files:
+            report_lines.append(f"⚠️ **Estimated files ({preview['estimated_files']:,}) exceeds limit ({self.limits.max_files:,})**")
+            report_lines.append("   Consider adding more ignore patterns or reducing root directories.")
+            report_lines.append("")
+        
+        if preview['inaccessible_roots'] > 0:
+            report_lines.append("⚠️ **Some root directories are inaccessible**")
+            report_lines.append("   Check paths and permissions for inaccessible roots.")
+            report_lines.append("")
+        
+        if not self.security.dry_run:
+            report_lines.append("💡 **Enable dry-run mode** to preview searches without execution:")
+            report_lines.append("   Set `security.dry_run: true` in your configuration.")
+            report_lines.append("")
+        
+        report_lines.extend([
+            "---",
+            "",
+            "*This preview shows what would be searched based on your current configuration.*",
+            "*Actual results may vary based on file system changes and search queries.*"
+        ])
+        
+        return "\n".join(report_lines)
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert configuration to dictionary representation."""

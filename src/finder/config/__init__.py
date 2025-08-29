@@ -1,5 +1,24 @@
 """
-Configuration management for the AI Filesystem Finder.
+Configuration management package for AI Filesystem Finder.
 
-This module handles YAML configuration parsing, validation, and security checks.
+This package provides configuration parsing, validation, and management
+functionality for the AI Filesystem Finder application.
 """
+
+from .parser import (
+    ConfigParser,
+    ConfigParseResult,
+    ConfigurationError,
+    load_config,
+    validate_config_file,
+    create_config_template
+)
+
+__all__ = [
+    'ConfigParser',
+    'ConfigParseResult', 
+    'ConfigurationError',
+    'load_config',
+    'validate_config_file',
+    'create_config_template'
+]

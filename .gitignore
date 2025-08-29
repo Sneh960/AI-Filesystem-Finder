@@ -188,6 +188,8 @@ Thumbs.db
 *.log
 logs/
 .finderagent.yaml
+.finderagent.yaml.example
+example_dry_run_config.yaml
 
 # API keys and sensitive data
 api_keys.txt
